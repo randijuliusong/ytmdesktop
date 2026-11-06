@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import logo from "~assets/icons/ytmd.png";
-import { YTMViewStatus } from "~shared/types";
+import { YTMViewStatus, TransportState } from "~shared/types";
 
 const unresponsive = ref(false);
 const hide = ref(false);
@@ -20,6 +20,7 @@ const ytmViewLoadingStatusMessage = computed(() => {
 });
 const ytmViewLoadTimedOut = ref(false);
 const ytmViewLoadError = ref(null);
+const transport = ref<TransportState | null>(null);
 
 let ytmViewTimeout = setTimeout(() => {
   ytmViewLoadTimedOut.value = true;
@@ -41,6 +42,7 @@ window.ytmd.ytmViewLoadError(loadError => {
 });
 window.ytmd.memoryStore.onStateChanged(newState => {
   unresponsive.value = newState.ytmViewUnresponsive ?? false;
+  transport.value = newState.networkTransport ?? null;
 });
 
 window.ytmd.appViewHiding(() => {
