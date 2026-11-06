@@ -9,7 +9,13 @@ export default defineConfig(config => {
         build: {
             outDir: ".vite/main",
             rolldownOptions: {
-                external: ["xosms"]
+                external: ["xosms"],
+                // Services and integrations are keyed by their class name, so a
+                // mangled name collides with another one and the app refuses to
+                // start. Keep the names the source declares.
+                output: {
+                    keepNames: true
+                }
             }
         },
         define: {
