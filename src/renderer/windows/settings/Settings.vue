@@ -3,6 +3,7 @@ import { ref } from "vue";
 import KeybindInput from "../../components/KeybindInput.vue";
 import YTMDSetting from "../../components/YTMDSetting.vue";
 import { StoreSchema, TrayIconStyle } from "~shared/store/schema";
+import { TransportState } from "~shared/types";
 import { AuthToken } from "~shared/integrations/companion-server/types";
 import logo from "~assets/icons/ytmd.png";
 
@@ -76,8 +77,15 @@ const shortcutVolumeMute = ref<string>(shortcuts.volumeMute);
 const shortcutToggleShuffle = ref<string>(shortcuts.toggleShuffle);
 const shortcutToggleRepeat = ref<string>(shortcuts.toggleRepeat);
 
-const lastFMSessionKey = ref<string>(lastFM.sessionKey);
-const scrobblePercent = ref<number>(lastFM.scrobblePercent);
+const lastFMSessionKey = ref<string>(lastfm.sessionKey);
+const scrobblePercent = ref<number>(lastfm.scrobblePercent);
+
+const network: StoreSchema["network"] = await store.get("network");
+const transport = ref<"auto" | "handshake" | "quic">(network.transport);
+const transportState = ref<TransportState | null>((await memoryStore.get("networkTransport")) ?? null);
+window.ytmd.memoryStore.onStateChanged(newState => {
+  transportState.value = newState.networkTransport ?? null;
+});
 
 store.onDidAnyChange(async newState => {
   disableHardwareAcceleration.value = newState.general.disableHardwareAcceleration;
@@ -108,6 +116,8 @@ store.onDidAnyChange(async newState => {
   lastFMSessionKey.value = newState.lastfm.sessionKey;
   scrobblePercent.value = newState.lastfm.scrobblePercent;
   enhancedMediaServiceEnabled.value = newState.integrations.enhancedMediaServiceEnabled;
+
+  transport.value = newState.network.transport;
 
   shortcutPlayPause.value = newState.shortcuts.playPause;
   shortcutNext.value = newState.shortcuts.next;
@@ -191,6 +201,8 @@ async function settingsChanged() {
   store.set("integrations.lastFMEnabled", lastFMEnabled.value);
   store.set("lastfm.scrobblePercent", scrobblePercent.value);
   store.set("integrations.enhancedMediaServiceEnabled", enhancedMediaServiceEnabled.value);
+
+  store.set("network.transport", transport.value);
 
   store.set("shortcuts.playPause", shortcutPlayPause.value);
   store.set("shortcuts.next", shortcutNext.value);
@@ -328,6 +340,12 @@ window.ytmd.handleUpdateDownloaded(() => {
           @click="changeTab(5)"
         >
           <span class="material-symbols-outlined">keyboard</span>Shortcuts
+        </li>
+        <li
+          :class="{ active: currentTab === 6 }"
+          @click="changeTab(6)"
+        >
+          <span class="material-symbols-outlined">swap_vert_circle</span>Network
         </li>
         <span class="push" />
         <li
@@ -782,6 +800,33 @@ window.ytmd.handleUpdateDownloaded(() => {
               @change="settingsChanged"
             />
           </div>
+        </div>
+
+        <div
+          v-if="currentTab === 6"
+          class="network-tab"
+        >
+          <YTMDSetting
+            v-model="transport"
+            :options-map="{ auto: 'Auto (probe the standard handshake)', handshake: 'Standard handshake (TCP/TLS)', quic: 'QUIC (HTTP/3)' }"
+            type="select"
+            restart-required
+            name="Transport"
+            description="How the app reaches YouTube Music. Auto probes the standard TLS handshake and falls back to QUIC when the network blocks it."
+            @change="settingChangedRequiresRestart"
+          />
+          <p
+            v-if="transportState"
+            class="network-status"
+          >
+            In use: {{ transportState.effective === "quic" ? "QUIC (HTTP/3)" : "standard handshake (TCP/TLS)" }}
+            <template v-if="transportState.mode === 'auto'">
+              · probe {{ transportState.probe.reachable ? "succeeded" : "failed" }} in {{ transportState.probe.ms }}ms
+              <template v-if="transportState.probe.error">
+                ({{ transportState.probe.error }})
+              </template>
+            </template>
+          </p>
         </div>
 
         <div
