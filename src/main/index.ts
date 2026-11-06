@@ -27,6 +27,7 @@ import MemoryStore from "./services/memorystore";
 import { MemoryStoreSchema, TrayIconStyle } from "~shared/store/schema";
 import ProtocolManager from "./services/protocolmanager";
 import PlayerStateStore from "./services/playerstatestore";
+import Transport from "./services/transport";
 import ProtectedAPIManager from "./services/protectedapimanager";
 import { VideoType } from "~shared/playerstatestore/types";
 
@@ -44,6 +45,7 @@ serviceCollection.addServices([
   ConfigStore,
   AppWindowManager,
   MemoryStore<MemoryStoreSchema>,
+  Transport,
   AutoUpdater,
   StateManager,
   ProtectedAPIManager,

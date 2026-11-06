@@ -12,6 +12,27 @@ export enum YTMViewStatus {
   LoadFailed
 }
 
+/**
+ * How the app reaches YouTube Music.
+ *
+ * - auto: probe the standard TLS handshake, use it when it works, force QUIC when it does not
+ * - handshake: the standard TLS handshake only, QUIC disabled
+ * - quic: HTTP/3 only, forced for the configured YouTube origins
+ */
+export type TransportMode = "auto" | "handshake" | "quic";
+
+/** The transport the app settled on, and why. */
+export type TransportState = {
+  mode: TransportMode;
+  effective: "handshake" | "quic";
+  probe: {
+    reachable: boolean;
+    ms: number;
+    error: string;
+  };
+  flags: string[];
+};
+
 export enum YTMViewSetupCompletionFlags {
   /**
    * This is an exclusive flag which when set will make all other flags ignored

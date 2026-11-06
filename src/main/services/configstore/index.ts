@@ -48,6 +48,21 @@ export default class ConfigStore extends Service {
           progressInTaskbar: false,
           ratioVolume: false
         },
+        network: {
+          transport: "quic",
+          quicOrigins: ["music.youtube.com:443", "www.youtube.com:443"],
+          // Keep the QUIC connection alive: a filter that reaps the flow
+          // otherwise ends the connection, Chromium marks QUIC broken for the
+          // origin and falls back to a transport the filter blocks.
+          quicFlags: [
+            "--quic_max_retransmittable_on_wire_ping_count=8",
+            "--quic_max_aggressive_retransmittable_on_wire_ping_count=8",
+            "--quiche_reloadable_flag_quic_close_on_idle_timeout=false",
+            "--quiche_reloadable_flag_quic_default_enable_5rto_blackhole_detection2=false",
+            "--quiche_reloadable_flag_quic_fix_timeouts=true"
+          ],
+          transportProbeTimeoutMs: 1500
+        },
         integrations: {
           companionServerEnabled: false,
           companionServerAuthTokens: null,

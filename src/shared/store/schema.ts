@@ -1,3 +1,5 @@
+import { TransportState } from "~shared/types";
+
 export enum TrayIconStyle {
   Auto = 0,
   White = 1,
@@ -29,6 +31,12 @@ export type StoreSchema = {
     enableSpeakerFill: boolean;
     progressInTaskbar: boolean;
     ratioVolume: boolean;
+  };
+  network: {
+    transport: "auto" | "handshake" | "quic";
+    quicOrigins: string[];
+    quicFlags: string[];
+    transportProbeTimeoutMs: number;
   };
   integrations: {
     companionServerEnabled: boolean;
@@ -102,4 +110,6 @@ export type MemoryStoreSchema = {
 
   lastFMAuthenticationStep: number;
   lastFMToken: string;
+
+  networkTransport: TransportState;
 };
