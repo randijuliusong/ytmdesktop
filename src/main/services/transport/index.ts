@@ -1,6 +1,6 @@
 import { app } from "electron";
 import log from "electron-log";
-import tls from "node:tls";
+import { spawnSync } from "node:child_process";
 import Service from "../service";
 import ConfigStore from "../configstore";
 import MemoryStore from "../memorystore";
@@ -17,7 +17,10 @@ import { DependencyConstructor, TransportMode, TransportState } from "~shared/ty
  * startup.
  *
  * The decision has to reach Chromium's command line before the network stack
- * starts, so it happens during the pre-initialised lifecycle.
+ * starts, so it happens during the pre-initialised lifecycle. The probes run
+ * curl instead of the network stack of this process, because the process is
+ * about to start its own and cannot answer a question about the network while
+ * it is still starting up.
  */
 export default class Transport extends Service {
   public static override readonly dependencies: DependencyConstructor<Service>[] = [
@@ -37,6 +40,8 @@ export default class Transport extends Service {
     "--quiche_reloadable_flag_quic_fix_timeouts=true"
   ];
 
+  private curlAvailable: boolean | null = null;
+
   public override onPreInitialized() {
     const configStore = this.getDependency(ConfigStore);
 
@@ -49,7 +54,9 @@ export default class Transport extends Service {
     let probe: TransportState["probe"] = { reachable: true, ms: 0, error: "" };
 
     if (mode === "auto") {
-      probe = this.probeHandshake("music.youtube.com", probeTimeout);
+      const started = Date.now();
+      const result = this.probeHandshake("music.youtube.com", probeTimeout);
+      probe = { reachable: result.ok, ms: Date.now() - started, error: result.error };
       effective = probe.reachable ? "handshake" : "quic";
       log.info(`Transport probe: handshake ${probe.reachable ? "succeeded" : "failed"} in ${probe.ms}ms, using ${effective}`);
     }
@@ -60,6 +67,16 @@ export default class Transport extends Service {
       flags.push("--enable-quic");
       if (origins.length) flags.push(`--origin-to-force-quic-on=${origins.join(",")}`);
       flags.push(...quicFlags);
+
+      // YouTube answers on several anycast addresses and a filtered network
+      // rejects some of them, so the first address the resolver hands out is
+      // often a dead one. Pick an address that answers over HTTP/3 and point
+      // Chromium at it.
+      const selected = this.selectWorkingAddress("music.youtube.com", probeTimeout, 4);
+      if (selected) {
+        flags.push(`--host-resolver-rules=MAP music.youtube.com ${selected.ip}, MAP www.youtube.com ${selected.ip}`);
+        log.info(`Transport: selected ${selected.ip} for the YouTube origins`);
+      }
     } else {
       flags.push("--disable-quic");
     }
@@ -80,50 +97,108 @@ export default class Transport extends Service {
   public override onTerminated() {}
 
   /**
-   * Opens a TLS connection with the SNI of the host and reports whether the
-   * handshake completed.
+   * Reports whether the standard handshake reaches the host.
    *
    * A network that filters the SNI either refuses the connection or drops the
-   * handshake, and both look like a failed handshake here, which is the answer
+   * handshake, and both look like a failed request here, which is the answer
    * the transport choice needs.
    */
-  private probeHandshake(host: string, timeoutMs: number): TransportState["probe"] {
-    const started = Date.now();
-    const result = { reachable: false, ms: 0, error: "" };
-    const flag = new Int32Array(new SharedArrayBuffer(4));
+  private probeHandshake(host: string, timeoutMs: number): { ok: boolean; error: string } {
+    if (!this.hasCurl()) return { ok: false, error: "no curl" };
 
-    const settle = (error: string) => {
-      result.reachable = error === "";
-      result.ms = Date.now() - started;
-      result.error = error;
-      Atomics.store(flag, 0, 1);
-      Atomics.notify(flag, 0);
-    };
-
-    const socket = tls.connect(
-      { host, port: 443, servername: host, timeout: timeoutMs, rejectUnauthorized: true },
-      () => {
-        socket.destroy();
-        settle("");
-      }
+    const result = spawnSync(
+      "curl",
+      ["-4", "-s", "-o", "/dev/null", "-m", String(Math.max(1, Math.ceil(timeoutMs / 1000))), `https://${host}/`],
+      { timeout: timeoutMs + 1000, stdio: "ignore" }
     );
-    socket.on("error", error => settle((error as NodeJS.ErrnoException).code || error.message));
-    socket.on("timeout", () => {
-      socket.destroy();
-      settle("TIMEOUT");
-    });
 
-    const deadline = Date.now() + timeoutMs + 500;
-    while (Atomics.load(flag, 0) === 0 && Date.now() < deadline) {
-      Atomics.wait(flag, 0, 0, 50);
+    return { ok: result.status === 0, error: result.status === 0 ? "" : `curl exit ${result.status}` };
+  }
+
+  /**
+   * Finds an address of the host that answers over HTTP/3.
+   */
+  private selectWorkingAddress(host: string, timeoutMs: number, maxAddresses: number): { ip: string; ms: number } | null {
+    if (!this.hasCurl()) {
+      log.info("Transport: no HTTP/3 client available, keeping the resolver's address");
+      return null;
     }
 
-    if (Atomics.load(flag, 0) === 0) {
-      socket.destroy();
-      settle("TIMEOUT");
+    const started = Date.now();
+    const addresses = this.resolveAddresses(host);
+
+    if (!addresses.length) {
+      log.info(`Transport: could not resolve ${host}`);
+      return null;
     }
 
-    return result;
+    log.info(`Transport: ${host} resolves to ${addresses.length} addresses, probing ${Math.min(addresses.length, maxAddresses)}`);
+
+    for (const ip of addresses.slice(0, maxAddresses)) {
+      const answers = this.answersOverHttp3(host, ip, timeoutMs);
+      log.info(`Transport: ${ip} ${answers ? "answers over HTTP/3" : "does not answer"}`);
+      if (answers) return { ip, ms: Date.now() - started };
+    }
+
+    return null;
+  }
+
+  private answersOverHttp3(host: string, ip: string, timeoutMs: number): boolean {
+    const result = spawnSync(
+      "curl",
+      [
+        "--http3-only",
+        "-4",
+        "-s",
+        "-o",
+        "/dev/null",
+        "-m",
+        String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+        "--resolve",
+        `${host}:443:${ip}`,
+        `https://${host}/generate_204`
+      ],
+      { timeout: timeoutMs + 1000, stdio: "ignore" }
+    );
+
+    return result.status === 0;
+  }
+
+  /**
+   * Resolves the addresses of the host without waiting on the event loop.
+   */
+  private resolveAddresses(host: string): string[] {
+    const getent = spawnSync("getent", ["ahostsv4", host], { timeout: 5000, encoding: "utf8" });
+    if (getent.status === 0 && getent.stdout) {
+      const addresses = getent.stdout
+        .split("\n")
+        .map(line => line.trim().split(/\s+/)[0])
+        .filter(address => /^\d+\.\d+\.\d+\.\d+$/.test(address));
+      if (addresses.length) return [...new Set(addresses)];
+    }
+
+    const node = spawnSync(
+      process.execPath,
+      ["-e", "require('node:dns').promises.resolve4(process.argv[1]).then(a=>console.log(a.join('\\n'))).catch(()=>{})", host],
+      { timeout: 5000, encoding: "utf8" }
+    );
+    if (node.status === 0 && node.stdout) {
+      return node.stdout.split("\n").map(line => line.trim()).filter(address => /^\d+\.\d+\.\d+\.\d+$/.test(address));
+    }
+
+    return [];
+  }
+
+  private hasCurl(): boolean {
+    if (this.curlAvailable === null) {
+      try {
+        const result = spawnSync("curl", ["--version"], { timeout: 5000, encoding: "utf8" });
+        this.curlAvailable = result.status === 0 && /HTTP3/.test(result.stdout ?? "");
+      } catch {
+        this.curlAvailable = false;
+      }
+    }
+    return this.curlAvailable;
   }
 
   private applyFlag(flag: string) {
