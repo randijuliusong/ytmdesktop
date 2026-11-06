@@ -58,8 +58,13 @@ export default class Transport extends Service {
       const started = Date.now();
       const result = this.probeHandshake("music.youtube.com", probeTimeout);
       probe = { reachable: result.ok, ms: Date.now() - started, error: result.error };
-      effective = probe.reachable ? "handshake" : "quic";
-      log.info(`Transport probe: handshake ${probe.reachable ? "succeeded" : "failed"} in ${probe.ms}ms, using ${effective}`);
+      // Without a client to probe with, the network is unknown: keep the
+      // standard handshake, which is what an unfiltered network wants.
+      effective = result.ok || result.unknown ? "handshake" : "quic";
+      log.info(`Transport probe: handshake ${result.unknown ? "not possible" : probe.reachable ? "succeeded" : "failed"} in ${probe.ms}ms, using ${effective}`);
+      if (result.unknown) {
+        log.warn("Transport: no client to probe the network with, keeping the standard handshake. Switch the transport to QUIC in the settings if YouTube does not load.");
+      }
     }
 
     const flags: string[] = [];
@@ -104,8 +109,8 @@ export default class Transport extends Service {
    * handshake, and both look like a failed request here, which is the answer
    * the transport choice needs.
    */
-  private probeHandshake(host: string, timeoutMs: number): { ok: boolean; error: string } {
-    if (!this.hasCurl()) return { ok: false, error: "no curl" };
+  private probeHandshake(host: string, timeoutMs: number): { ok: boolean; unknown: boolean; error: string } {
+    if (!this.hasCurl()) return { ok: false, unknown: true, error: "no curl" };
 
     const result = spawnSync(
       "curl",
@@ -113,7 +118,7 @@ export default class Transport extends Service {
       { timeout: timeoutMs + 1000, stdio: "ignore" }
     );
 
-    return { ok: result.status === 0, error: result.status === 0 ? "" : `curl exit ${result.status}` };
+    return { ok: result.status === 0, unknown: false, error: result.status === 0 ? "" : `curl exit ${result.status}` };
   }
 
   /**
