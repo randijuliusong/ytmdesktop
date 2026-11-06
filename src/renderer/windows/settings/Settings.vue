@@ -345,7 +345,7 @@ window.ytmd.handleUpdateDownloaded(() => {
           :class="{ active: currentTab === 6 }"
           @click="changeTab(6)"
         >
-          <span class="material-symbols-outlined">swap_vert_circle</span>Network
+          <span class="material-symbols-outlined">lan</span>Network
         </li>
         <span class="push" />
         <li
