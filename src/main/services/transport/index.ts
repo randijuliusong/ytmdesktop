@@ -53,6 +53,7 @@ export default class Transport extends Service {
 
     let effective: "handshake" | "quic" = mode === "handshake" ? "handshake" : "quic";
     let probe: TransportState["probe"] = { reachable: true, ms: 0, error: "" };
+    let address = "";
 
     if (mode === "auto") {
       const started = Date.now();
@@ -80,6 +81,7 @@ export default class Transport extends Service {
       // Chromium at it.
       const selected = this.selectWorkingAddress("music.youtube.com", probeTimeout, 4);
       if (selected) {
+        address = selected.ip;
         flags.push(`--host-resolver-rules=MAP music.youtube.com ${selected.ip}, MAP www.youtube.com ${selected.ip}`);
         log.info(`Transport: selected ${selected.ip} for the YouTube origins`);
       }
@@ -92,7 +94,7 @@ export default class Transport extends Service {
     log.info(`Transport: mode=${mode} effective=${effective} flags=${flags.join(" ") || "none"}`);
 
     const memoryStore = this.getDependency(MemoryStore<MemoryStoreSchema>);
-    memoryStore.set("networkTransport", { mode, effective, probe, flags } satisfies TransportState);
+    memoryStore.set("networkTransport", { mode, effective, probe, flags, address } satisfies TransportState);
   }
 
   public override onInitialized() {

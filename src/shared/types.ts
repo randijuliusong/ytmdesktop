@@ -31,6 +31,7 @@ export type TransportState = {
     error: string;
   };
   flags: string[];
+  address: string;
 };
 
 export enum YTMViewSetupCompletionFlags {

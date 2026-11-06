@@ -77,8 +77,8 @@ const shortcutVolumeMute = ref<string>(shortcuts.volumeMute);
 const shortcutToggleShuffle = ref<string>(shortcuts.toggleShuffle);
 const shortcutToggleRepeat = ref<string>(shortcuts.toggleRepeat);
 
-const lastFMSessionKey = ref<string>(lastfm.sessionKey);
-const scrobblePercent = ref<number>(lastfm.scrobblePercent);
+const lastFMSessionKey = ref<string>(lastFM.sessionKey);
+const scrobblePercent = ref<number>(lastFM.scrobblePercent);
 
 const network: StoreSchema["network"] = await store.get("network");
 const transport = ref<"auto" | "handshake" | "quic">(network.transport);
@@ -825,6 +825,9 @@ window.ytmd.handleUpdateDownloaded(() => {
               <template v-if="transportState.probe.error">
                 ({{ transportState.probe.error }})
               </template>
+            </template>
+            <template v-if="transportState.address">
+              · address {{ transportState.address }}
             </template>
           </p>
         </div>
