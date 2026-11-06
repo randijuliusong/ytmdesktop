@@ -41,6 +41,7 @@ export default class Transport extends Service {
   ];
 
   private curlAvailable: boolean | null = null;
+  private curlVersionOutput: string | null = null;
 
   public override onPreInitialized() {
     const configStore = this.getDependency(ConfigStore);
@@ -119,7 +120,7 @@ export default class Transport extends Service {
    * Finds an address of the host that answers over HTTP/3.
    */
   private selectWorkingAddress(host: string, timeoutMs: number, maxAddresses: number): { ip: string; ms: number } | null {
-    if (!this.hasCurl()) {
+    if (!this.hasHttp3Curl()) {
       log.info("Transport: no HTTP/3 client available, keeping the resolver's address");
       return null;
     }
@@ -191,14 +192,31 @@ export default class Transport extends Service {
 
   private hasCurl(): boolean {
     if (this.curlAvailable === null) {
-      try {
-        const result = spawnSync("curl", ["--version"], { timeout: 5000, encoding: "utf8" });
-        this.curlAvailable = result.status === 0 && /HTTP3/.test(result.stdout ?? "");
-      } catch {
-        this.curlAvailable = false;
-      }
+      this.curlAvailable = this.curlVersion().length > 0;
     }
     return this.curlAvailable;
+  }
+
+  /**
+   * Whether the curl of this machine speaks HTTP/3.
+   *
+   * The Windows curl that ships with the system does not, so address probing
+   * is skipped there and the resolver keeps its own choice.
+   */
+  private hasHttp3Curl(): boolean {
+    return /HTTP3/.test(this.curlVersion());
+  }
+
+  private curlVersion(): string {
+    if (this.curlVersionOutput === null) {
+      try {
+        const result = spawnSync("curl", ["--version"], { timeout: 5000, encoding: "utf8" });
+        this.curlVersionOutput = result.status === 0 ? (result.stdout ?? "") : "";
+      } catch {
+        this.curlVersionOutput = "";
+      }
+    }
+    return this.curlVersionOutput;
   }
 
   private applyFlag(flag: string) {

@@ -49,7 +49,9 @@ export default class ConfigStore extends Service {
           ratioVolume: false
         },
         network: {
-          transport: "quic",
+          // Auto decides per network: the standard handshake where it works,
+          // QUIC where the network filters it.
+          transport: "auto",
           quicOrigins: ["music.youtube.com:443", "www.youtube.com:443"],
           // Keep the QUIC connection alive: a filter that reaps the flow
           // otherwise ends the connection, Chromium marks QUIC broken for the
