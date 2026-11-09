@@ -4,7 +4,6 @@ import { spawnSync } from 'node:child_process';
 import Service from '../service';
 import ConfigStore from '../configstore';
 import MemoryStore from '../memorystore';
-import YTMViewManager from '../ytmviewmanager';
 import { MemoryStoreSchema } from '~shared/store/schema';
 import {
   DependencyConstructor,
@@ -29,7 +28,7 @@ import {
  */
 export default class Transport extends Service {
   public static override readonly dependencies: DependencyConstructor<Service>[] =
-    [ConfigStore, MemoryStore<MemoryStoreSchema>, YTMViewManager];
+    [ConfigStore, MemoryStore<MemoryStoreSchema>];
 
   // Keep the QUIC connection alive: a filter that reaps the flow otherwise ends
   // the connection, Chromium marks QUIC broken for the origin and falls back to
@@ -53,16 +52,16 @@ export default class Transport extends Service {
   // UDP state, and the next request then has to re-handshake a network that no
   // longer admits the flow. The keepalive pings the origins through the view's
   // own session so the connection stays established while the app sits idle,
-  // and its failure streak is what drives the reload and relaunch recovery.
+  // and after a YouTube-only failure streak it relaunches the app, which is
+  // the only place the address mapping can be re-probed.
   private static readonly KEEPALIVE_INTERVAL_MS = 20_000;
   private static readonly KEEPALIVE_URL =
     'https://music.youtube.com/generate_204';
-  private static readonly RELOAD_AFTER_FAILURES = 3;
-  private static readonly RESTART_AFTER_FAILURES = 9;
+  private static readonly SYSTEM_URL = 'https://www.gstatic.com/generate_204';
+  private static readonly RELAUNCH_AFTER_FAILURES = 3;
   private static readonly RESTART_MIN_GAP_MS = 10 * 60 * 1000;
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private keepaliveFailures = 0;
-  private keepaliveReloaded = false;
   private lastRecoveryRestartAt = 0;
 
   public override onPreInitialized() {
@@ -194,45 +193,52 @@ export default class Transport extends Service {
         `Transport: keepalive recovered after ${this.keepaliveFailures} failures`,
       );
       this.keepaliveFailures = 0;
-      this.keepaliveReloaded = false;
     }
     log.debug(`Transport: keepalive ${status} in ${ms}ms`);
   }
 
-  private onKeepaliveFailure(error: unknown) {
-    this.keepaliveFailures += 1;
+  private async onKeepaliveFailure(error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
+
+    // Tell a general loss of connectivity from a YouTube-only one: one normal
+    // HTTPS request (TCP, no command-line forcing) to an unfiltered host. A
+    // dead network cannot be repaired by the app, so it must not count into
+    // the recovery ladder and must not relaunch the app in a loop.
+    try {
+      await session
+        .fromPartition(
+          app.isPackaged ? 'persist:ytmview' : 'persist:ytmview-dev',
+        )
+        .fetch(Transport.SYSTEM_URL, { signal: AbortSignal.timeout(5_000) });
+    } catch {
+      log.info(
+        `Transport: the system has no network (${this.keepaliveFailures > 0 ? `${this.keepaliveFailures} failed keepalive(s) before` : 'since startup'}), keeping the keepalive failures out of the recovery ladder`,
+      );
+      return;
+    }
+
+    this.keepaliveFailures += 1;
     log.warn(
       `Transport: keepalive failed ${this.keepaliveFailures} time(s): ${message}`,
     );
 
-    if (
-      this.keepaliveFailures === Transport.RELOAD_AFTER_FAILURES &&
-      !this.keepaliveReloaded
-    ) {
-      this.keepaliveReloaded = true;
-      const view = this.getDependency(YTMViewManager).getView();
-      if (view?.webContents) {
-        log.warn(
-          'Transport: network keeps failing through the keepalive, reloading the YouTube view',
-        );
-        view.webContents.reload();
-      }
-    }
+    if (this.keepaliveFailures < Transport.RELAUNCH_AFTER_FAILURES) return;
 
-    if (
-      this.keepaliveFailures >= Transport.RESTART_AFTER_FAILURES &&
-      Date.now() - this.lastRecoveryRestartAt >= Transport.RESTART_MIN_GAP_MS
-    ) {
-      this.lastRecoveryRestartAt = Date.now();
-      // A restart is the only point where the mapped address can be re-probed:
-      // command-line switches cannot change while Chromium is running.
-      log.error(
-        'Transport: network keeps failing through the keepalive, relaunching the app to re-probe the network',
+    const gap = Date.now() - this.lastRecoveryRestartAt;
+    if (gap < Transport.RESTART_MIN_GAP_MS) {
+      log.warn(
+        `Transport: the recovery relaunch ran ${(gap / 1000).toFixed(0)}s ago, waiting it out`,
       );
-      app.relaunch();
-      app.exit(0);
+      return;
     }
+    this.lastRecoveryRestartAt = Date.now();
+    // A relaunch is the only point where the mapped address can be re-probed:
+    // command-line switches do not change while Chromium is running.
+    log.error(
+      'Transport: the system answers but the YouTube path keeps failing, relaunching the app to re-probe the network',
+    );
+    app.relaunch();
+    app.exit(0);
   }
 
   /**
