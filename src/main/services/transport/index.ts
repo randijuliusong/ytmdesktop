@@ -51,14 +51,16 @@ export default class Transport extends Service {
   // A QUIC session with no traffic dies within the idle window of the filter's
   // UDP state, and the next request then has to re-handshake a network that no
   // longer admits the flow. The keepalive pings the origins through the view's
-  // own session so the connection stays established while the app sits idle,
-  // and after a YouTube-only failure streak it relaunches the app, which is
-  // the only place the address mapping can be re-probed.
+  // own session so the connection stays established while the app sits idle.
+  // A failing path usually heals by itself: Chromium retries the origin
+  // internally as long as something keeps asking, which this loop does, so the
+  // app only relaunches after several minutes of a continuous failure, since
+  // relaunch is the only place the address mapping can be re-probed.
   private static readonly KEEPALIVE_INTERVAL_MS = 20_000;
   private static readonly KEEPALIVE_URL =
     'https://music.youtube.com/generate_204';
   private static readonly SYSTEM_URL = 'https://www.gstatic.com/generate_204';
-  private static readonly RELAUNCH_AFTER_FAILURES = 3;
+  private static readonly RELAUNCH_AFTER_FAILURES = 9;
   private static readonly RESTART_MIN_GAP_MS = 10 * 60 * 1000;
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private keepaliveFailures = 0;
