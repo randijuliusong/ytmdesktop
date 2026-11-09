@@ -1,6 +1,8 @@
-import { app, session } from 'electron';
+import { app, session, powerMonitor } from 'electron';
 import log from 'electron-log';
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
+import { createHash } from 'node:crypto';
 import Service from '../service';
 import ConfigStore from '../configstore';
 import MemoryStore from '../memorystore';
@@ -63,11 +65,19 @@ export default class Transport extends Service {
   // the failure is persistent, the ladder restarts Chromium's network service
   // process (well under a minute apart) so it rebuilds the resolver cache and
   // the QUIC pools and hands out a current address. The app process, its
-  // views and its windows are never touched.
-  private static readonly KEEPALIVE_INTERVAL_MS = 20_000;
+  // views and its windows are never touched. The cadence and the first-run
+  // burst in the store schema keep the UDP flow awake through the idle
+  // windows, the suspend/wake cycle and interface changes; those handlers
+  // probe first, since a QUIC connection can migrate across an IP change
+  // without a rebuild.
   private static readonly KEEPALIVE_URL =
     'https://music.youtube.com/generate_204';
   private static readonly SYSTEM_URL = 'https://www.gstatic.com/generate_204';
+  /** Default keepalive cadence; configurable in network.keepaliveIntervalMs. */
+  private static readonly DEFAULT_KEEPALIVE_INTERVAL_MS = 10_000;
+  /** Faster ticks right after a recovered path, to ride out flaps. */
+  private static readonly RECOVERY_BURST_COUNT = 3;
+  private static readonly RECOVERY_BURST_MS = 5_000;
   /** The first failure streak step that restarts the network service. */
   private static readonly FIRST_NETWORK_RESTART = 3;
   /** How many further failures between additional network service restarts. */
@@ -75,9 +85,17 @@ export default class Transport extends Service {
   /** Hard cap of network service restarts per hour to keep Chromium healthy. */
   private static readonly NETWORK_RESTARTS_PER_HOUR = 5;
   private keepaliveTimer: NodeJS.Timeout | null = null;
+  private keepaliveInFlight = false;
+  private keepaliveIntervalMs = Transport.DEFAULT_KEEPALIVE_INTERVAL_MS;
   private keepaliveFailures = 0;
+  private recoveryBurstLeft = 0;
   private networkRestartTimestamps: number[] = [];
   private sawMainFrameFailure = false;
+  private lastNicFingerprint: string | null = null;
+  private metricDay = '';
+  private metricFailures = 0;
+  private metricNetworkRestarts = 0;
+  private metricHeals = 0;
 
   public override onPreInitialized() {
     const configStore = this.getDependency(ConfigStore);
@@ -160,8 +178,24 @@ export default class Transport extends Service {
         `Recorded a main-frame load failure (${error?.code}, ${error?.description}), waiting for the transport to recover and reloading the view`,
       );
     });
-    this.scheduleKeepalive(Transport.KEEPALIVE_INTERVAL_MS);
-    log.info('Transport: transport keepalive started');
+    const configStore = this.getDependency(ConfigStore);
+    this.keepaliveIntervalMs =
+      configStore.get('network.keepaliveIntervalMs') ??
+      Transport.DEFAULT_KEEPALIVE_INTERVAL_MS;
+
+    // Waking from suspend hands out new UDP paths: probe right away instead
+    // of waiting a tick. QUIC can migrate the existing connection, and the
+    // failure ladder only runs when the probe itself fails.
+    powerMonitor.on('resume', () => {
+      log.info('Transport: system resumed, probing the QUIC path immediately');
+      void this.runKeepalive();
+    });
+
+    this.lastNicFingerprint = this.nicFingerprint();
+    this.scheduleKeepalive(this.keepaliveIntervalMs);
+    log.info(
+      `Transport: transport keepalive started at ${this.keepaliveIntervalMs}ms cadence`,
+    );
   }
 
   public override onTerminated() {
@@ -182,6 +216,10 @@ export default class Transport extends Service {
    * the same network context, QUIC pool and resolver rules as YouTube.
    */
   private runKeepalive() {
+    if (this.keepaliveInFlight) return;
+    this.keepaliveInFlight = true;
+    this.trackNicChange();
+    this.trackMetricDay();
     const started = Date.now();
     const partition = app.isPackaged
       ? 'persist:ytmview'
@@ -193,7 +231,60 @@ export default class Transport extends Service {
         this.onKeepaliveSuccess(response.status, Date.now() - started),
       )
       .catch((error: unknown) => this.onKeepaliveFailure(error))
-      .finally(() => this.scheduleKeepalive(Transport.KEEPALIVE_INTERVAL_MS));
+      .finally(() => {
+        this.keepaliveInFlight = false;
+        const next =
+          this.recoveryBurstLeft > 0
+            ? Transport.RECOVERY_BURST_MS
+            : this.keepaliveIntervalMs;
+        this.scheduleKeepalive(next);
+      });
+  }
+
+  /**
+   * Hashes the current interface list so a new address after suspend,
+   * Wi-Fi switch or roaming gets an immediate probe on the next tick: a
+   * QUIC connection can migrate there, and only a failing probe climbs
+   * the ladder.
+   */
+  private nicFingerprint(): string {
+    const parts: string[] = [];
+    for (const [name, addresses] of Object.entries(os.networkInterfaces())) {
+      for (const address of addresses ?? []) {
+        parts.push(`${name}/${address.family}/${address.address}`);
+      }
+    }
+    return createHash('sha256')
+      .update(parts.sort().join('|'))
+      .digest('hex')
+      .slice(0, 32);
+  }
+
+  private trackNicChange() {
+    const fingerprint = this.nicFingerprint();
+    if (this.lastNicFingerprint && this.lastNicFingerprint !== fingerprint) {
+      log.info(
+        'Transport: network interfaces changed, the next keepalive probes the new path',
+      );
+      // The current run sorts a fresh probe out; no restart here, migration
+      // should keep the flow alive.
+    }
+    this.lastNicFingerprint = fingerprint;
+  }
+
+  private trackMetricDay() {
+    const day = new Date().toISOString().slice(0, 10);
+    if (day !== this.metricDay) {
+      if (this.metricDay) {
+        log.info(
+          `Transport: UDP session metric for ${this.metricDay}: ${this.metricFailures} failing keepalive(s), ${this.metricNetworkRestarts} network service restart(s), ${this.metricHeals} healed streak(s)`,
+        );
+      }
+      this.metricDay = day;
+      this.metricFailures = 0;
+      this.metricNetworkRestarts = 0;
+      this.metricHeals = 0;
+    }
   }
 
   private onKeepaliveSuccess(status: number, ms: number) {
@@ -203,6 +294,10 @@ export default class Transport extends Service {
       );
       this.keepaliveFailures = 0;
       this.networkRestartTimestamps = [];
+      this.recoveryBurstLeft = Transport.RECOVERY_BURST_COUNT;
+      this.metricHeals += 1;
+    } else if (this.recoveryBurstLeft > 0) {
+      this.recoveryBurstLeft -= 1;
     }
     if (this.sawMainFrameFailure) {
       this.sawMainFrameFailure =
@@ -232,6 +327,7 @@ export default class Transport extends Service {
     }
 
     this.keepaliveFailures += 1;
+    this.metricFailures += 1;
     log.warn(
       `Transport: keepalive failed ${this.keepaliveFailures} time(s): ${message}`,
     );
@@ -280,6 +376,7 @@ export default class Transport extends Service {
       { timeout: 5000 },
     );
     this.networkRestartTimestamps.push(Date.now());
+    this.metricNetworkRestarts += 1;
 
     if (kill.status === 0) {
       log.warn(

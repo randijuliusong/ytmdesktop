@@ -1,9 +1,9 @@
-import { TransportState } from "~shared/types";
+import { TransportState } from '~shared/types';
 
 export enum TrayIconStyle {
   Auto = 0,
   White = 1,
-  Black = 2
+  Black = 2,
 }
 
 export type StoreSchema = {
@@ -33,10 +33,11 @@ export type StoreSchema = {
     ratioVolume: boolean;
   };
   network: {
-    transport: "auto" | "handshake" | "quic";
+    transport: 'auto' | 'handshake' | 'quic';
     quicOrigins: string[];
     quicFlags: string[];
     transportProbeTimeoutMs: number;
+    keepaliveIntervalMs: number;
   };
   integrations: {
     companionServerEnabled: boolean;
