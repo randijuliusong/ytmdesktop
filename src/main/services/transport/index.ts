@@ -1,11 +1,16 @@
-import { app } from "electron";
-import log from "electron-log";
-import { spawnSync } from "node:child_process";
-import Service from "../service";
-import ConfigStore from "../configstore";
-import MemoryStore from "../memorystore";
-import { MemoryStoreSchema } from "~shared/store/schema";
-import { DependencyConstructor, TransportMode, TransportState } from "~shared/types";
+import { app, session } from 'electron';
+import log from 'electron-log';
+import { spawnSync } from 'node:child_process';
+import Service from '../service';
+import ConfigStore from '../configstore';
+import MemoryStore from '../memorystore';
+import YTMViewManager from '../ytmviewmanager';
+import { MemoryStoreSchema } from '~shared/store/schema';
+import {
+  DependencyConstructor,
+  TransportMode,
+  TransportState,
+} from '~shared/types';
 
 /**
  * Chooses how the app reaches YouTube Music and applies it to Chromium.
@@ -23,86 +28,212 @@ import { DependencyConstructor, TransportMode, TransportState } from "~shared/ty
  * it is still starting up.
  */
 export default class Transport extends Service {
-  public static override readonly dependencies: DependencyConstructor<Service>[] = [
-    ConfigStore,
-    MemoryStore<MemoryStoreSchema>
-  ];
+  public static override readonly dependencies: DependencyConstructor<Service>[] =
+    [ConfigStore, MemoryStore<MemoryStoreSchema>, YTMViewManager];
 
   // Keep the QUIC connection alive: a filter that reaps the flow otherwise ends
   // the connection, Chromium marks QUIC broken for the origin and falls back to
   // a transport the filter blocks.
-  private static readonly DEFAULT_QUIC_ORIGINS = ["music.youtube.com:443", "www.youtube.com:443"];
+  private static readonly DEFAULT_QUIC_ORIGINS = [
+    'music.youtube.com:443',
+    'www.youtube.com:443',
+  ];
   private static readonly DEFAULT_QUIC_FLAGS = [
-    "--quic_max_retransmittable_on_wire_ping_count=8",
-    "--quic_max_aggressive_retransmittable_on_wire_ping_count=8",
-    "--quiche_reloadable_flag_quic_close_on_idle_timeout=false",
-    "--quiche_reloadable_flag_quic_default_enable_5rto_blackhole_detection2=false",
-    "--quiche_reloadable_flag_quic_fix_timeouts=true"
+    '--quic_max_retransmittable_on_wire_ping_count=8',
+    '--quic_max_aggressive_retransmittable_on_wire_ping_count=8',
+    '--quiche_reloadable_flag_quic_close_on_idle_timeout=false',
+    '--quiche_reloadable_flag_quic_default_enable_5rto_blackhole_detection2=false',
+    '--quiche_reloadable_flag_quic_fix_timeouts=true',
   ];
 
   private curlAvailable: boolean | null = null;
   private curlVersionOutput: string | null = null;
 
+  // A QUIC session with no traffic dies within the idle window of the filter's
+  // UDP state, and the next request then has to re-handshake a network that no
+  // longer admits the flow. The keepalive pings the origins through the view's
+  // own session so the connection stays established while the app sits idle,
+  // and its failure streak is what drives the reload and relaunch recovery.
+  private static readonly KEEPALIVE_INTERVAL_MS = 20_000;
+  private static readonly KEEPALIVE_URL =
+    'https://music.youtube.com/generate_204';
+  private static readonly RELOAD_AFTER_FAILURES = 3;
+  private static readonly RESTART_AFTER_FAILURES = 9;
+  private static readonly RESTART_MIN_GAP_MS = 10 * 60 * 1000;
+  private keepaliveTimer: NodeJS.Timeout | null = null;
+  private keepaliveFailures = 0;
+  private keepaliveReloaded = false;
+  private lastRecoveryRestartAt = 0;
+
   public override onPreInitialized() {
     const configStore = this.getDependency(ConfigStore);
 
-    const mode = (configStore.get("network.transport") ?? "quic") as TransportMode;
-    const origins = configStore.get("network.quicOrigins") ?? Transport.DEFAULT_QUIC_ORIGINS;
-    const quicFlags = configStore.get("network.quicFlags") ?? Transport.DEFAULT_QUIC_FLAGS;
-    const probeTimeout = configStore.get("network.transportProbeTimeoutMs") ?? 1500;
+    const mode = (configStore.get('network.transport') ??
+      'quic') as TransportMode;
+    const origins =
+      configStore.get('network.quicOrigins') ?? Transport.DEFAULT_QUIC_ORIGINS;
+    const quicFlags =
+      configStore.get('network.quicFlags') ?? Transport.DEFAULT_QUIC_FLAGS;
+    const probeTimeout =
+      configStore.get('network.transportProbeTimeoutMs') ?? 1500;
 
-    let effective: "handshake" | "quic" = mode === "handshake" ? "handshake" : "quic";
-    let probe: TransportState["probe"] = { reachable: true, ms: 0, error: "" };
-    let address = "";
+    let effective: 'handshake' | 'quic' =
+      mode === 'handshake' ? 'handshake' : 'quic';
+    let probe: TransportState['probe'] = { reachable: true, ms: 0, error: '' };
+    let address = '';
 
-    if (mode === "auto") {
+    if (mode === 'auto') {
       const started = Date.now();
-      const result = this.probeHandshake("music.youtube.com", probeTimeout);
-      probe = { reachable: result.ok, ms: Date.now() - started, error: result.error };
+      const result = this.probeHandshake('music.youtube.com', probeTimeout);
+      probe = {
+        reachable: result.ok,
+        ms: Date.now() - started,
+        error: result.error,
+      };
       // Without a client to probe with, the network is unknown: keep the
       // standard handshake, which is what an unfiltered network wants.
-      effective = result.ok || result.unknown ? "handshake" : "quic";
-      log.info(`Transport probe: handshake ${result.unknown ? "not possible" : probe.reachable ? "succeeded" : "failed"} in ${probe.ms}ms, using ${effective}`);
+      effective = result.ok || result.unknown ? 'handshake' : 'quic';
+      log.info(
+        `Transport probe: handshake ${result.unknown ? 'not possible' : probe.reachable ? 'succeeded' : 'failed'} in ${probe.ms}ms, using ${effective}`,
+      );
       if (result.unknown) {
-        log.warn("Transport: no client to probe the network with, keeping the standard handshake. Switch the transport to QUIC in the settings if YouTube does not load.");
+        log.warn(
+          'Transport: no client to probe the network with, keeping the standard handshake. Switch the transport to QUIC in the settings if YouTube does not load.',
+        );
       }
     }
 
     const flags: string[] = [];
 
-    if (effective === "quic") {
-      flags.push("--enable-quic");
-      if (origins.length) flags.push(`--origin-to-force-quic-on=${origins.join(",")}`);
+    if (effective === 'quic') {
+      flags.push('--enable-quic');
+      if (origins.length)
+        flags.push(`--origin-to-force-quic-on=${origins.join(',')}`);
       flags.push(...quicFlags);
 
       // YouTube answers on several anycast addresses and a filtered network
       // rejects some of them, so the first address the resolver hands out is
       // often a dead one. Pick an address that answers over HTTP/3 and point
       // Chromium at it.
-      const selected = this.selectWorkingAddress("music.youtube.com", probeTimeout, 4);
+      const selected = this.selectWorkingAddress(
+        'music.youtube.com',
+        probeTimeout,
+        4,
+      );
       if (selected) {
         address = selected.ip;
-        flags.push(`--host-resolver-rules=MAP music.youtube.com ${selected.ip}, MAP www.youtube.com ${selected.ip}`);
+        flags.push(
+          `--host-resolver-rules=MAP music.youtube.com ${selected.ip}, MAP www.youtube.com ${selected.ip}`,
+        );
         log.info(`Transport: selected ${selected.ip} for the YouTube origins`);
       }
     } else {
-      flags.push("--disable-quic");
+      flags.push('--disable-quic');
     }
 
     for (const flag of flags) this.applyFlag(flag);
 
-    log.info(`Transport: mode=${mode} effective=${effective} flags=${flags.join(" ") || "none"}`);
+    log.info(
+      `Transport: mode=${mode} effective=${effective} flags=${flags.join(' ') || 'none'}`,
+    );
 
     const memoryStore = this.getDependency(MemoryStore<MemoryStoreSchema>);
-    memoryStore.set("networkTransport", { mode, effective, probe, flags, address } satisfies TransportState);
+    memoryStore.set('networkTransport', {
+      mode,
+      effective,
+      probe,
+      flags,
+      address,
+    } satisfies TransportState);
   }
 
   public override onInitialized() {
-    log.info("Transport initialized");
+    log.info('Transport initialized');
   }
 
-  public override onPostInitialized() {}
-  public override onTerminated() {}
+  public override onPostInitialized() {
+    this.scheduleKeepalive(Transport.KEEPALIVE_INTERVAL_MS);
+    log.info('Transport: transport keepalive started');
+  }
+
+  public override onTerminated() {
+    clearTimeout(this.keepaliveTimer ?? undefined);
+    this.keepaliveTimer = null;
+  }
+
+  private scheduleKeepalive(delayMs: number) {
+    if (this.keepaliveTimer) clearTimeout(this.keepaliveTimer);
+    this.keepaliveTimer = setTimeout(() => {
+      this.keepaliveTimer = null;
+      void this.runKeepalive();
+    }, delayMs);
+  }
+
+  /**
+   * Requests a URL over the view's own session so the keep-alive request shares
+   * the same network context, QUIC pool and resolver rules as YouTube.
+   */
+  private runKeepalive() {
+    const started = Date.now();
+    const partition = app.isPackaged
+      ? 'persist:ytmview'
+      : 'persist:ytmview-dev';
+    session
+      .fromPartition(partition)
+      .fetch(Transport.KEEPALIVE_URL, { signal: AbortSignal.timeout(10_000) })
+      .then((response) =>
+        this.onKeepaliveSuccess(response.status, Date.now() - started),
+      )
+      .catch((error: unknown) => this.onKeepaliveFailure(error))
+      .finally(() => this.scheduleKeepalive(Transport.KEEPALIVE_INTERVAL_MS));
+  }
+
+  private onKeepaliveSuccess(status: number, ms: number) {
+    if (this.keepaliveFailures > 0) {
+      log.info(
+        `Transport: keepalive recovered after ${this.keepaliveFailures} failures`,
+      );
+      this.keepaliveFailures = 0;
+      this.keepaliveReloaded = false;
+    }
+    log.debug(`Transport: keepalive ${status} in ${ms}ms`);
+  }
+
+  private onKeepaliveFailure(error: unknown) {
+    this.keepaliveFailures += 1;
+    const message = error instanceof Error ? error.message : String(error);
+    log.warn(
+      `Transport: keepalive failed ${this.keepaliveFailures} time(s): ${message}`,
+    );
+
+    if (
+      this.keepaliveFailures === Transport.RELOAD_AFTER_FAILURES &&
+      !this.keepaliveReloaded
+    ) {
+      this.keepaliveReloaded = true;
+      const view = this.getDependency(YTMViewManager).getView();
+      if (view?.webContents) {
+        log.warn(
+          'Transport: network keeps failing through the keepalive, reloading the YouTube view',
+        );
+        view.webContents.reload();
+      }
+    }
+
+    if (
+      this.keepaliveFailures >= Transport.RESTART_AFTER_FAILURES &&
+      Date.now() - this.lastRecoveryRestartAt >= Transport.RESTART_MIN_GAP_MS
+    ) {
+      this.lastRecoveryRestartAt = Date.now();
+      // A restart is the only point where the mapped address can be re-probed:
+      // command-line switches cannot change while Chromium is running.
+      log.error(
+        'Transport: network keeps failing through the keepalive, relaunching the app to re-probe the network',
+      );
+      app.relaunch();
+      app.exit(0);
+    }
+  }
 
   /**
    * Reports whether the standard handshake reaches the host.
@@ -111,24 +242,45 @@ export default class Transport extends Service {
    * handshake, and both look like a failed request here, which is the answer
    * the transport choice needs.
    */
-  private probeHandshake(host: string, timeoutMs: number): { ok: boolean; unknown: boolean; error: string } {
-    if (!this.hasCurl()) return { ok: false, unknown: true, error: "no curl" };
+  private probeHandshake(
+    host: string,
+    timeoutMs: number,
+  ): { ok: boolean; unknown: boolean; error: string } {
+    if (!this.hasCurl()) return { ok: false, unknown: true, error: 'no curl' };
 
     const result = spawnSync(
-      "curl",
-      ["-4", "-s", "-o", "/dev/null", "-m", String(Math.max(1, Math.ceil(timeoutMs / 1000))), `https://${host}/`],
-      { timeout: timeoutMs + 1000, stdio: "ignore" }
+      'curl',
+      [
+        '-4',
+        '-s',
+        '-o',
+        '/dev/null',
+        '-m',
+        String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+        `https://${host}/`,
+      ],
+      { timeout: timeoutMs + 1000, stdio: 'ignore' },
     );
 
-    return { ok: result.status === 0, unknown: false, error: result.status === 0 ? "" : `curl exit ${result.status}` };
+    return {
+      ok: result.status === 0,
+      unknown: false,
+      error: result.status === 0 ? '' : `curl exit ${result.status}`,
+    };
   }
 
   /**
    * Finds an address of the host that answers over HTTP/3.
    */
-  private selectWorkingAddress(host: string, timeoutMs: number, maxAddresses: number): { ip: string; ms: number } | null {
+  private selectWorkingAddress(
+    host: string,
+    timeoutMs: number,
+    maxAddresses: number,
+  ): { ip: string; ms: number } | null {
     if (!this.hasHttp3Curl()) {
-      log.info("Transport: no HTTP/3 client available, keeping the resolver's address");
+      log.info(
+        "Transport: no HTTP/3 client available, keeping the resolver's address",
+      );
       return null;
     }
 
@@ -140,33 +292,41 @@ export default class Transport extends Service {
       return null;
     }
 
-    log.info(`Transport: ${host} resolves to ${addresses.length} addresses, probing ${Math.min(addresses.length, maxAddresses)}`);
+    log.info(
+      `Transport: ${host} resolves to ${addresses.length} addresses, probing ${Math.min(addresses.length, maxAddresses)}`,
+    );
 
     for (const ip of addresses.slice(0, maxAddresses)) {
       const answers = this.answersOverHttp3(host, ip, timeoutMs);
-      log.info(`Transport: ${ip} ${answers ? "answers over HTTP/3" : "does not answer"}`);
+      log.info(
+        `Transport: ${ip} ${answers ? 'answers over HTTP/3' : 'does not answer'}`,
+      );
       if (answers) return { ip, ms: Date.now() - started };
     }
 
     return null;
   }
 
-  private answersOverHttp3(host: string, ip: string, timeoutMs: number): boolean {
+  private answersOverHttp3(
+    host: string,
+    ip: string,
+    timeoutMs: number,
+  ): boolean {
     const result = spawnSync(
-      "curl",
+      'curl',
       [
-        "--http3-only",
-        "-4",
-        "-s",
-        "-o",
-        "/dev/null",
-        "-m",
+        '--http3-only',
+        '-4',
+        '-s',
+        '-o',
+        '/dev/null',
+        '-m',
         String(Math.max(1, Math.ceil(timeoutMs / 1000))),
-        "--resolve",
+        '--resolve',
         `${host}:443:${ip}`,
-        `https://${host}/generate_204`
+        `https://${host}/generate_204`,
       ],
-      { timeout: timeoutMs + 1000, stdio: "ignore" }
+      { timeout: timeoutMs + 1000, stdio: 'ignore' },
     );
 
     return result.status === 0;
@@ -176,22 +336,32 @@ export default class Transport extends Service {
    * Resolves the addresses of the host without waiting on the event loop.
    */
   private resolveAddresses(host: string): string[] {
-    const getent = spawnSync("getent", ["ahostsv4", host], { timeout: 5000, encoding: "utf8" });
+    const getent = spawnSync('getent', ['ahostsv4', host], {
+      timeout: 5000,
+      encoding: 'utf8',
+    });
     if (getent.status === 0 && getent.stdout) {
       const addresses = getent.stdout
-        .split("\n")
-        .map(line => line.trim().split(/\s+/)[0])
-        .filter(address => /^\d+\.\d+\.\d+\.\d+$/.test(address));
+        .split('\n')
+        .map((line) => line.trim().split(/\s+/)[0])
+        .filter((address) => /^\d+\.\d+\.\d+\.\d+$/.test(address));
       if (addresses.length) return [...new Set(addresses)];
     }
 
     const node = spawnSync(
       process.execPath,
-      ["-e", "require('node:dns').promises.resolve4(process.argv[1]).then(a=>console.log(a.join('\\n'))).catch(()=>{})", host],
-      { timeout: 5000, encoding: "utf8" }
+      [
+        '-e',
+        "require('node:dns').promises.resolve4(process.argv[1]).then(a=>console.log(a.join('\\n'))).catch(()=>{})",
+        host,
+      ],
+      { timeout: 5000, encoding: 'utf8' },
     );
     if (node.status === 0 && node.stdout) {
-      return node.stdout.split("\n").map(line => line.trim()).filter(address => /^\d+\.\d+\.\d+\.\d+$/.test(address));
+      return node.stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((address) => /^\d+\.\d+\.\d+\.\d+$/.test(address));
     }
 
     return [];
@@ -217,23 +387,30 @@ export default class Transport extends Service {
   private curlVersion(): string {
     if (this.curlVersionOutput === null) {
       try {
-        const result = spawnSync("curl", ["--version"], { timeout: 5000, encoding: "utf8" });
-        this.curlVersionOutput = result.status === 0 ? (result.stdout ?? "") : "";
+        const result = spawnSync('curl', ['--version'], {
+          timeout: 5000,
+          encoding: 'utf8',
+        });
+        this.curlVersionOutput =
+          result.status === 0 ? (result.stdout ?? '') : '';
       } catch {
-        this.curlVersionOutput = "";
+        this.curlVersionOutput = '';
       }
     }
     return this.curlVersionOutput;
   }
 
   private applyFlag(flag: string) {
-    const withoutDashes = flag.replace(/^--/, "");
-    const separator = withoutDashes.indexOf("=");
+    const withoutDashes = flag.replace(/^--/, '');
+    const separator = withoutDashes.indexOf('=');
 
     if (separator === -1) {
       app.commandLine.appendSwitch(withoutDashes);
     } else {
-      app.commandLine.appendSwitch(withoutDashes.slice(0, separator), withoutDashes.slice(separator + 1));
+      app.commandLine.appendSwitch(
+        withoutDashes.slice(0, separator),
+        withoutDashes.slice(separator + 1),
+      );
     }
   }
 }
