@@ -25,14 +25,19 @@ import {
  * curl instead of the network stack of this process, because the process is
  * about to start its own and cannot answer a question about the network while
  * it is still starting up.
+ *
+ * QUIC mode never pins an address and never restarts the app. Reliability
+ * comes from the keepalive loop below, and when the path stays broken, from
+ * restarting Chromium's network service process, which rebuilds the QUIC
+ * pools and the resolver cache inside the same app process.
  */
 export default class Transport extends Service {
   public static override readonly dependencies: DependencyConstructor<Service>[] =
     [ConfigStore, MemoryStore<MemoryStoreSchema>];
 
-  // Keep the QUIC connection alive: a filter that reaps the flow otherwise ends
-  // the connection, Chromium marks QUIC broken for the origin and falls back to
-  // a transport the filter blocks.
+  // Keep the QUIC connection alive: a filter that reaps the flow otherwise
+  // ends the connection, Chromium marks QUIC broken for the origin and falls
+  // back to a transport the filter blocks.
   private static readonly DEFAULT_QUIC_ORIGINS = [
     'music.youtube.com:443',
     'www.youtube.com:443',
@@ -53,18 +58,24 @@ export default class Transport extends Service {
   // longer admits the flow. The keepalive pings the origins through the view's
   // own session so the connection stays established while the app sits idle.
   // A failing path usually heals by itself: Chromium retries the origin
-  // internally as long as something keeps asking, which this loop does, so the
-  // app only relaunches after several minutes of a continuous failure, since
-  // relaunch is the only place the address mapping can be re-probed.
+  // internally as long as something keeps asking, which this loop does. When
+  // the failure is persistent, the ladder restarts Chromium's network service
+  // process (well under a minute apart) so it rebuilds the resolver cache and
+  // the QUIC pools and hands out a current address. The app process, its
+  // views and its windows are never touched.
   private static readonly KEEPALIVE_INTERVAL_MS = 20_000;
   private static readonly KEEPALIVE_URL =
     'https://music.youtube.com/generate_204';
   private static readonly SYSTEM_URL = 'https://www.gstatic.com/generate_204';
-  private static readonly RELAUNCH_AFTER_FAILURES = 9;
-  private static readonly RESTART_MIN_GAP_MS = 10 * 60 * 1000;
+  /** The first failure streak step that restarts the network service. */
+  private static readonly FIRST_NETWORK_RESTART = 3;
+  /** How many further failures between additional network service restarts. */
+  private static readonly NETWORK_RESTART_STEP = 3;
+  /** Hard cap of network service restarts per hour to keep Chromium healthy. */
+  private static readonly NETWORK_RESTARTS_PER_HOUR = 5;
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private keepaliveFailures = 0;
-  private lastRecoveryRestartAt = 0;
+  private networkRestartTimestamps: number[] = [];
 
   public override onPreInitialized() {
     const configStore = this.getDependency(ConfigStore);
@@ -81,7 +92,6 @@ export default class Transport extends Service {
     let effective: 'handshake' | 'quic' =
       mode === 'handshake' ? 'handshake' : 'quic';
     let probe: TransportState['probe'] = { reachable: true, ms: 0, error: '' };
-    let address = '';
 
     if (mode === 'auto') {
       const started = Date.now();
@@ -111,23 +121,11 @@ export default class Transport extends Service {
       if (origins.length)
         flags.push(`--origin-to-force-quic-on=${origins.join(',')}`);
       flags.push(...quicFlags);
-
-      // YouTube answers on several anycast addresses and a filtered network
-      // rejects some of them, so the first address the resolver hands out is
-      // often a dead one. Pick an address that answers over HTTP/3 and point
-      // Chromium at it.
-      const selected = this.selectWorkingAddress(
-        'music.youtube.com',
-        probeTimeout,
-        4,
-      );
-      if (selected) {
-        address = selected.ip;
-        flags.push(
-          `--host-resolver-rules=MAP music.youtube.com ${selected.ip}, MAP www.youtube.com ${selected.ip}`,
-        );
-        log.info(`Transport: selected ${selected.ip} for the YouTube origins`);
-      }
+      // No address is pinned on purpose. Chromium resolves the origins itself,
+      // its QUIC session pool walks the answer set, and the keepalive below
+      // keeps the resolver cache and the pools fresh for as long as the app
+      // runs, so the connection follows the network instead of betting on one
+      // address at startup.
     } else {
       flags.push('--disable-quic');
     }
@@ -144,7 +142,7 @@ export default class Transport extends Service {
       effective,
       probe,
       flags,
-      address,
+      address: '',
     } satisfies TransportState);
   }
 
@@ -195,6 +193,7 @@ export default class Transport extends Service {
         `Transport: keepalive recovered after ${this.keepaliveFailures} failures`,
       );
       this.keepaliveFailures = 0;
+      this.networkRestartTimestamps = [];
     }
     log.debug(`Transport: keepalive ${status} in ${ms}ms`);
   }
@@ -205,7 +204,7 @@ export default class Transport extends Service {
     // Tell a general loss of connectivity from a YouTube-only one: one normal
     // HTTPS request (TCP, no command-line forcing) to an unfiltered host. A
     // dead network cannot be repaired by the app, so it must not count into
-    // the recovery ladder and must not relaunch the app in a loop.
+    // the recovery ladder and must not churn the network service in a loop.
     try {
       await session
         .fromPartition(
@@ -224,23 +223,64 @@ export default class Transport extends Service {
       `Transport: keepalive failed ${this.keepaliveFailures} time(s): ${message}`,
     );
 
-    if (this.keepaliveFailures < Transport.RELAUNCH_AFTER_FAILURES) return;
+    const due =
+      this.keepaliveFailures === Transport.FIRST_NETWORK_RESTART ||
+      (this.keepaliveFailures > Transport.FIRST_NETWORK_RESTART &&
+        (this.keepaliveFailures - Transport.FIRST_NETWORK_RESTART) %
+          Transport.NETWORK_RESTART_STEP ===
+          0);
+    if (!due) return;
 
-    const gap = Date.now() - this.lastRecoveryRestartAt;
-    if (gap < Transport.RESTART_MIN_GAP_MS) {
+    const now = Date.now();
+    this.networkRestartTimestamps = this.networkRestartTimestamps.filter(
+      (t) => now - t < 60 * 60 * 1000,
+    );
+    if (
+      this.networkRestartTimestamps.length >=
+      Transport.NETWORK_RESTARTS_PER_HOUR
+    ) {
       log.warn(
-        `Transport: the recovery relaunch ran ${(gap / 1000).toFixed(0)}s ago, waiting it out`,
+        'Transport: the network service restarts hit the hourly cap, waiting for the keepalive to bring the path back',
       );
       return;
     }
-    this.lastRecoveryRestartAt = Date.now();
-    // A relaunch is the only point where the mapped address can be re-probed:
-    // command-line switches do not change while Chromium is running.
-    log.error(
-      'Transport: the system answers but the YouTube path keeps failing, relaunching the app to re-probe the network',
+
+    this.restartNetworkService();
+  }
+
+  /**
+   * Kills this app's Chromium network service utility process. Chromium
+   * immediately respawns it with the same command line, which rebuilds the
+   * DNS cache, every QUIC pool and the broken service state while the app
+   * process, its views and its windows keep running.
+   */
+  private restartNetworkService() {
+    // The pid column pattern is anchored to the fifth field so the pipeline's
+    // own bash -c line (which contains the pattern text as an argument) can
+    // never match and kill itself.
+    const kill = spawnSync(
+      'bash',
+      [
+        '-c',
+        `ps axo pid,ppid,cmd | awk -v app=${process.pid} '$2==app && $5=="--utility-sub-type=network.mojom.NetworkService" {print $1}' | xargs -r kill -9`,
+      ],
+      { timeout: 5000 },
     );
-    app.relaunch();
-    app.exit(0);
+    this.networkRestartTimestamps.push(Date.now());
+
+    if (kill.status === 0) {
+      log.warn(
+        `Transport: the YouTube path keeps failing through the keepalive, restarting Chromium's network service to rebuild the QUIC pools`,
+      );
+    } else {
+      log.error(
+        `Transport: could not restart Chromium's network service (exit ${kill.status ?? 'signal'}): ${String(
+          kill.stderr ?? '',
+        )
+          .trim()
+          .slice(0, 200)}`,
+      );
+    }
   }
 
   /**
@@ -277,119 +317,11 @@ export default class Transport extends Service {
     };
   }
 
-  /**
-   * Finds an address of the host that answers over HTTP/3.
-   */
-  private selectWorkingAddress(
-    host: string,
-    timeoutMs: number,
-    maxAddresses: number,
-  ): { ip: string; ms: number } | null {
-    if (!this.hasHttp3Curl()) {
-      log.info(
-        "Transport: no HTTP/3 client available, keeping the resolver's address",
-      );
-      return null;
-    }
-
-    const started = Date.now();
-    const addresses = this.resolveAddresses(host);
-
-    if (!addresses.length) {
-      log.info(`Transport: could not resolve ${host}`);
-      return null;
-    }
-
-    log.info(
-      `Transport: ${host} resolves to ${addresses.length} addresses, probing ${Math.min(addresses.length, maxAddresses)}`,
-    );
-
-    for (const ip of addresses.slice(0, maxAddresses)) {
-      const answers = this.answersOverHttp3(host, ip, timeoutMs);
-      log.info(
-        `Transport: ${ip} ${answers ? 'answers over HTTP/3' : 'does not answer'}`,
-      );
-      if (answers) return { ip, ms: Date.now() - started };
-    }
-
-    return null;
-  }
-
-  private answersOverHttp3(
-    host: string,
-    ip: string,
-    timeoutMs: number,
-  ): boolean {
-    const result = spawnSync(
-      'curl',
-      [
-        '--http3-only',
-        '-4',
-        '-s',
-        '-o',
-        '/dev/null',
-        '-m',
-        String(Math.max(1, Math.ceil(timeoutMs / 1000))),
-        '--resolve',
-        `${host}:443:${ip}`,
-        `https://${host}/generate_204`,
-      ],
-      { timeout: timeoutMs + 1000, stdio: 'ignore' },
-    );
-
-    return result.status === 0;
-  }
-
-  /**
-   * Resolves the addresses of the host without waiting on the event loop.
-   */
-  private resolveAddresses(host: string): string[] {
-    const getent = spawnSync('getent', ['ahostsv4', host], {
-      timeout: 5000,
-      encoding: 'utf8',
-    });
-    if (getent.status === 0 && getent.stdout) {
-      const addresses = getent.stdout
-        .split('\n')
-        .map((line) => line.trim().split(/\s+/)[0])
-        .filter((address) => /^\d+\.\d+\.\d+\.\d+$/.test(address));
-      if (addresses.length) return [...new Set(addresses)];
-    }
-
-    const node = spawnSync(
-      process.execPath,
-      [
-        '-e',
-        "require('node:dns').promises.resolve4(process.argv[1]).then(a=>console.log(a.join('\\n'))).catch(()=>{})",
-        host,
-      ],
-      { timeout: 5000, encoding: 'utf8' },
-    );
-    if (node.status === 0 && node.stdout) {
-      return node.stdout
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((address) => /^\d+\.\d+\.\d+\.\d+$/.test(address));
-    }
-
-    return [];
-  }
-
   private hasCurl(): boolean {
     if (this.curlAvailable === null) {
       this.curlAvailable = this.curlVersion().length > 0;
     }
     return this.curlAvailable;
-  }
-
-  /**
-   * Whether the curl of this machine speaks HTTP/3.
-   *
-   * The Windows curl that ships with the system does not, so address probing
-   * is skipped there and the resolver keeps its own choice.
-   */
-  private hasHttp3Curl(): boolean {
-    return /HTTP3/.test(this.curlVersion());
   }
 
   private curlVersion(): string {
