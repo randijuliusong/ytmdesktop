@@ -7,10 +7,37 @@ import { VitePlugin } from '@electron-forge/plugin-vite';
 import { FusesPlugin } from '@electron-forge/plugin-fuses';
 import { FuseV1Options, FuseVersion } from '@electron/fuses';
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
+
+/**
+ * Local mirror for the electron artifacts: when the release hosts are
+ * unreachable (networks filter github release downloads the way they filter
+ * youtube), point YTM_ELECTRON_ARTIFACT_DIR at a folder with
+ * electron-<version>-<platform>-<arch>.zip and SHASUMS256.txt and packaging
+ * reads them from disk instead of the network.
+ */
+const localElectronDownloader = {
+  download: async (url: string, targetPath: string): Promise<void> => {
+    const dir = process.env.YTM_ELECTRON_ARTIFACT_DIR;
+    const source = dir ? path.resolve(dir, path.basename(url).split("?")[0]) : "";
+    if (!dir || !source || !fsSync.existsSync(source)) {
+      throw new Error(
+        `No local electron artifact for ${url}. Set YTM_ELECTRON_ARTIFACT_DIR to a folder containing the artifact files, or unset it to download normally.`,
+      );
+    }
+    console.log(`Serving ${path.basename(url)} from ${dir}`);
+    fsSync.copyFileSync(source, targetPath);
+  },
+};
 
 const config: ForgeConfig = {
   packagerConfig: {
+    download: process.env.YTM_ELECTRON_ARTIFACT_DIR
+      ? {
+          downloader: localElectronDownloader as never,
+        }
+      : {},
     executableName: "youtube-music-desktop-app",
     icon: "src/assets/icons/ytmd",
     extraResource: [

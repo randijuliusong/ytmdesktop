@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import Service from '../service';
 import ConfigStore from '../configstore';
 import MemoryStore from '../memorystore';
+import YTMViewManager from '../ytmviewmanager';
 import { MemoryStoreSchema } from '~shared/store/schema';
 import {
   DependencyConstructor,
@@ -33,7 +34,7 @@ import {
  */
 export default class Transport extends Service {
   public static override readonly dependencies: DependencyConstructor<Service>[] =
-    [ConfigStore, MemoryStore<MemoryStoreSchema>];
+    [ConfigStore, MemoryStore<MemoryStoreSchema>, YTMViewManager];
 
   // Keep the QUIC connection alive: a filter that reaps the flow otherwise
   // ends the connection, Chromium marks QUIC broken for the origin and falls
@@ -76,6 +77,7 @@ export default class Transport extends Service {
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private keepaliveFailures = 0;
   private networkRestartTimestamps: number[] = [];
+  private sawMainFrameFailure = false;
 
   public override onPreInitialized() {
     const configStore = this.getDependency(ConfigStore);
@@ -151,6 +153,13 @@ export default class Transport extends Service {
   }
 
   public override onPostInitialized() {
+    this.getDependency(YTMViewManager).on('load-errored', () => {
+      this.sawMainFrameFailure = true;
+      const error = this.getDependency(YTMViewManager).loadError;
+      log.info(
+        `Recorded a main-frame load failure (${error?.code}, ${error?.description}), waiting for the transport to recover and reloading the view`,
+      );
+    });
     this.scheduleKeepalive(Transport.KEEPALIVE_INTERVAL_MS);
     log.info('Transport: transport keepalive started');
   }
@@ -194,6 +203,10 @@ export default class Transport extends Service {
       );
       this.keepaliveFailures = 0;
       this.networkRestartTimestamps = [];
+    }
+    if (this.sawMainFrameFailure) {
+      this.sawMainFrameFailure =
+        this.getDependency(YTMViewManager).recoverFromLoadFailure();
     }
     log.debug(`Transport: keepalive ${status} in ${ms}ms`);
   }

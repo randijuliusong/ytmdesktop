@@ -477,6 +477,32 @@ export default class YTMViewManager extends EventEmitterService<YTMViewManagerEv
     return this.ytmView;
   }
 
+  /**
+   * Reloads the view when its last whole-page load failed and the transport
+   * has since recovered. The reload runs detached from any failure callback
+   * and is guarded: nothing happens when the view is gone, destroyed, already
+   * loading or its webContents is unavailable.
+   */
+  public recoverFromLoadFailure(): boolean {
+    if (this._status !== YTMViewStatus.LoadFailed) return false;
+    const webContents = this.ytmView?.webContents;
+    if (!webContents || webContents.isDestroyed() || webContents.isLoading())
+      return false;
+    log.info('Transport recovered, reloading the failed YouTube view');
+    setTimeout(() => {
+      try {
+        const target = this.ytmView?.webContents;
+        if (!target || target.isDestroyed() || target.isLoading()) return;
+        target.reload();
+      } catch (error) {
+        log.warn(
+          `Recovering the failed YouTube view instead threw: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }, 500);
+    return true;
+  }
+
   public async ready(): Promise<void> {
     await this.ytmView?.ready();
     if (!this.hooksReady)
